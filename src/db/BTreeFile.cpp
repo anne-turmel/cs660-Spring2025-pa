@@ -1,6 +1,4 @@
-#include <cmath>
 #include <cstring>
-#include <memory_resource>
 #include <db/BTreeFile.hpp>
 #include <db/Database.hpp>
 #include <db/IndexPage.hpp>
@@ -14,62 +12,88 @@ BTreeFile::BTreeFile(const std::string &name, const TupleDesc &td, size_t key_in
 
 void BTreeFile::insertTuple(const Tuple &t) {
     // TODO pa2
-    if (!td.compatible(t)) {
-        throw std::runtime_error("Tuple not compatible with TupleDesc");
-    }
-
-    // get root
+    std::vector<size_t> path;
     BufferPool &bufferPool = getDatabase().getBufferPool();
-    PageId pid{name, 0};
-    Page &p = bufferPool.getPage(pid);
+    PageId pid{name, root_id};
 
-    // keep track of pages seen so splitting can occur as necessary
-    IndexPage* page_path[(int)std::log(numPages)];
-    size_t page_nums[(int)std::log(numPages)];
-    int num_pages_seen = 0;
-    IndexPage ip(p);
-    page_path[num_pages_seen] = &ip;
-    page_nums[num_pages_seen] = 0;
-    if (ip.header->size != 0) {
-        int search_key = std::get<int>(t.get_field(key_index));
-        int search_guide;
-        do {
-            for (search_guide = 0; search_guide < page_path[num_pages_seen]->header->size; search_guide++) {
-                if (page_path[num_pages_seen]->keys[search_guide] <= search_key) {
-                    break;
-                }
-            }
-            if (page_path[num_pages_seen]->header->index_children) {
-                num_pages_seen++;
-                page_nums[num_pages_seen] = page_path[num_pages_seen - 1]->children[search_guide + 1];
-                IndexPage child(bufferPool.getPage(PageId{name, page_nums[num_pages_seen]}));
-                page_path[num_pages_seen] = &child;
-            } else {
+    Page &root_page = bufferPool.getPage(pid);
+    IndexPage root(root_page);
+    if (root.header->size == 0 && root.children[0] != 1) {
+        bufferPool.markDirty({name, root_id});
+        pid.page = numPages++;
+        root.children[0] = pid.page;
+    } else {
+        while (true) {
+            Page &page = bufferPool.getPage(pid);
+            IndexPage node(page);
+            auto pos = std::lower_bound(node.keys, node.keys + node.header->size,
+                                        std::get<int>(t.get_field(key_index)));
+            auto slot = pos - node.keys;
+            pid.page = node.children[slot];
+            if (!node.header->index_children) {
                 break;
             }
-        } while (true);
-        LeafPage child(bufferPool.getPage(PageId{name, page_path[num_pages_seen]->children[search_guide + 1]}), td, key_index);
-        if (child.insertTuple(t)) {
-            db::Page new_leaf_page{};
-            db::LeafPage new_leaf{new_leaf_page, td, key_index};
-            int new_key = child.split(new_leaf);
-            if (page_path[num_pages_seen]->insert(new_key, page_path[num_pages_seen]->children[search_guide])) {
-                while (num_pages_seen > 0) {
-                    db::Page new_page{};
-                    db::IndexPage new_index{new_page};
-                    new_key = page_path[num_pages_seen]->split(new_index);
-                    if (!page_path[num_pages_seen - 1]->insert(new_key, page_nums[num_pages_seen])) {
-                        break;
-                    }
-                    num_pages_seen--;
-                }
-                if (num_pages_seen <= 0) {
-                    db::Page new_root_page{};
-                    db::IndexPage new_root{new_root_page};
-                }
-            }
+            path.push_back(pid.page);
         }
     }
+
+    Page &page = bufferPool.getPage(pid);
+    bufferPool.markDirty(pid);
+    LeafPage leaf(page, td, key_index);
+    if (!leaf.insertTuple(t)) {
+        return;
+    }
+
+    pid.page = numPages++;
+    Page &new_leaf_page = bufferPool.getPage(pid);
+    bufferPool.markDirty(pid);
+    LeafPage new_leaf(new_leaf_page, td, key_index);
+    int new_key = leaf.split(new_leaf);
+    leaf.header->next_leaf = pid.page;
+    size_t new_child = pid.page;
+
+    while (!path.empty()) {
+        size_t parent_id = path.back();
+        path.pop_back();
+        pid.page = parent_id;
+        Page &parent_page = bufferPool.getPage(pid);
+        bufferPool.markDirty(pid);
+        IndexPage parent(parent_page);
+        if (!parent.insert(new_key, new_child)) {
+            return;
+        }
+
+        pid.page = numPages++;
+        Page &new_internal_page = bufferPool.getPage(pid);
+        bufferPool.markDirty(pid);
+        IndexPage new_internal(new_internal_page);
+        new_key = parent.split(new_internal);
+        new_child = pid.page;
+    }
+
+    bufferPool.markDirty({name, root_id});
+    if (!root.insert(new_key, new_child)) {
+        return;
+    }
+    pid.page = numPages++;
+    Page &new_child1 = bufferPool.getPage(pid);
+    bufferPool.markDirty(pid);
+    size_t child1 = pid.page;
+    new_child1 = root_page;
+    IndexPage child1_page(new_child1);
+
+    pid.page = numPages++;
+    Page &new_child2 = bufferPool.getPage(pid);
+    bufferPool.markDirty(pid);
+    size_t child2 = pid.page;
+    IndexPage child2_page(new_child2);
+
+    int key = child1_page.split(child2_page);
+    root.header->size = 1;
+    root.header->index_children = true;
+    root.keys[0] = key;
+    root.children[0] = child1;
+    root.children[1] = child2;
 }
 
 void BTreeFile::deleteTuple(const Iterator &it) {
@@ -80,70 +104,41 @@ Tuple BTreeFile::getTuple(const Iterator &it) const {
     // TODO pa2
     BufferPool &bufferPool = getDatabase().getBufferPool();
     PageId pid{name, it.page};
-    Page &p = bufferPool.getPage(pid);
-    LeafPage lp(p, td, key_index);
-    return lp.getTuple(it.slot);
+    Page &page = bufferPool.getPage(pid);
+    LeafPage leaf(page, td, key_index);
+    return leaf.getTuple(it.slot);
 }
 
 void BTreeFile::next(Iterator &it) const {
     // TODO pa2
     BufferPool &bufferPool = getDatabase().getBufferPool();
-    if (it.page != 0) {
-        PageId pid{name, it.page};
-        Page &p = bufferPool.getPage(pid);
-        const LeafPage lp(p, td, key_index);
+    PageId pid{name, it.page};
+    Page &page = bufferPool.getPage(pid);
+    LeafPage leaf(page, td, key_index);
+    if (it.slot + 1 < leaf.header->size) {
         it.slot++;
-        if (it.slot <= lp.header->size) {
-            return;
-        }
-        it.page = lp.header->next_leaf;
-    }
-    while (it.page != 0) {
-        PageId pid{name, it.page};
-        Page &p = bufferPool.getPage(pid);
-        const LeafPage lp(p, td, key_index);
+    } else {
+        it.page = leaf.header->next_leaf;
         it.slot = 0;
-        if (it.slot <= lp.header->size) {
-            return;
-        }
-        it.page = lp.header->next_leaf;
     }
 }
 
 Iterator BTreeFile::begin() const {
     // TODO pa2
     BufferPool &bufferPool = getDatabase().getBufferPool();
-    PageId pid{name, 0};
-    Page &p = bufferPool.getPage(pid);
-    IndexPage ip(p);
-    if (ip.header->size != 0) {
-        do {
-            if (ip.header->index_children) {
-                IndexPage child(bufferPool.getPage(PageId{name, ip.children[0]}));
-                ip = child;
-            } else {
-                return {*this, ip.children[0], 0};
-            }
-        } while (true);
+    PageId pid{name, root_id};
+    while (true) {
+        Page &page = bufferPool.getPage(pid);
+        IndexPage node(page);
+        pid.page = node.children[0];
+        if (!node.header->index_children) {
+            break;
+        }
     }
-    return {*this, 0, 0};
+    return {*this, pid.page, 0};
 }
 
 Iterator BTreeFile::end() const {
     // TODO pa2
-    BufferPool &bufferPool = getDatabase().getBufferPool();
-    PageId pid{name, 0};
-    Page &p = bufferPool.getPage(pid);
-    IndexPage ip(p);
-    if (ip.header->size != 0) {
-        do {
-            if (ip.header->index_children) {
-                IndexPage child(bufferPool.getPage(PageId{name, ip.children[ip.header->size - 1]}));
-                ip = child;
-            } else {
-                return {*this, ip.children[ip.header->size], 0};
-            }
-        } while (true);
-    }
     return {*this, 0, 0};
 }
