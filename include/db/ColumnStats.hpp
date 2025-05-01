@@ -9,6 +9,10 @@ namespace db {
  */
     class ColumnStats {
         // TODO pa4: add private members
+        int total;
+        std::vector<int> bucket_quantities;
+        int min;
+        int max;
 
     public:
         /**
